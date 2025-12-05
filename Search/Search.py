@@ -70,7 +70,8 @@ class SingleUnitDroneSearch:
         self.probability_map, self.crash_points = self.generate_probability_distribution()
         
         self.search_paths = {}
-        self.searched_flag_map = np.zeros((self.grid_height, self.grid_width), dtype=bool)
+        # 搜索计数图：记录每个网格单元被搜索了多少次
+        self.search_count_map = np.zeros((self.grid_height, self.grid_width), dtype=int) 
 
     # --- 概率分布和部署点方法 (保持不变) ---
     
@@ -195,7 +196,7 @@ class SingleUnitDroneSearch:
         return path[:max_steps]
 
     # --- 四种搜索算法路径生成 ---
-
+    # (spiral, grid, sector 保持不变)
     def spiral_search_path(self, start_point, max_steps=100):
         """螺旋搜索模式 (Spiral Search)"""
         path = [start_point]
@@ -274,19 +275,27 @@ class SingleUnitDroneSearch:
         
         return self._connect_points_to_path(path_points, start_point, max_steps)
 
-    def pso_search_path(self, start_point, max_steps=100):
-        """粒子群优化 (PSO) 路径"""
-        map_h, map_w = self.probability_map.shape
+    def pso_search_path(self, start_point, max_steps=100, pso_guidance_map=None):
+        """
+        粒子群优化 (PSO) 路径，使用当前的**后验概率图**进行引导 (递归贝叶斯)。
+        pso_guidance_map: 上一搜索段的后验概率图，作为当前段的先验指导。
+        """
+        # 如果未提供后验概率图，则使用初始静态概率图
+        if pso_guidance_map is None:
+            pso_guidance_map = self.probability_map
+            
+        map_h, map_w = pso_guidance_map.shape
         def fitness_func(position):
             x, y = int(position[0]), int(position[1])
-            if 0 <= x < map_w and 0 <= y < map_h: return self.probability_map[y, x]
+            # 适应度函数：最大化 PSO 粒子位置的当前后验概率（即当前 EPOS）
+            if 0 <= x < map_w and 0 <= y < map_h: return pso_guidance_map[y, x]
             return 0.0
 
         n_particles = 15
         max_iterations = 10 
         
-        flat_idx = np.argmax(self.probability_map)
-        gbest_y, gbest_x = np.unravel_index(flat_idx, self.probability_map.shape)
+        flat_idx = np.argmax(pso_guidance_map)
+        gbest_y, gbest_x = np.unravel_index(flat_idx, pso_guidance_map.shape)
         gbest_pos = np.array([gbest_x, gbest_y], dtype=float)
 
         particles = {
@@ -321,7 +330,9 @@ class SingleUnitDroneSearch:
                     particles['pbest_value'][i] = current_value
                     particles['pbest_pos'][i] = particles['pos'][i]
                     
-                if current_value > fitness_func(gbest_pos):
+                # 重新计算全局最优位置
+                current_gbest_val = fitness_func(gbest_pos)
+                if current_value > current_gbest_val:
                     gbest_pos = particles['pos'][i]
             
             for pos in particles['pbest_pos']:
@@ -330,92 +341,161 @@ class SingleUnitDroneSearch:
         return self._connect_points_to_path(path_points, start_point, max_steps)
 
 
-    # --- 核心方法 (路径依赖的 CPD - 累计探测概率模型) ---
+    # --- 核心方法 (贝叶斯更新路径搜索模拟) ---
     
-    def simulate_search(self, algorithm, max_time=100, setup_time=5):
-        """模拟单个搜索算法，计算累计探测概率 (CPD) 随时间的变化。"""
+    def simulate_search_bayesian(self, algorithm, max_time=100, setup_time=5, bayesian_update=False):
+        """
+        贝叶斯搜索模拟：计算累计探测概率 (CPD) 随时间的变化。
+        如果 bayesian_update=True，则 PSO 算法将利用递归贝叶斯更新进行动态路径规划。
+        """
         deployment_points = self.probability_based_deployment() 
         point = deployment_points[0]
         point_tuple = (int(point[0]), int(point[1]))
         
-        if algorithm == 'spiral': path = self.spiral_search_path(point_tuple)
-        elif algorithm == 'grid': path = self.grid_search_path(point_tuple)
-        elif algorithm == 'sector': path = self.sector_search_path(point_tuple)
-        elif algorithm == 'pso': path = self.pso_search_path(point_tuple)
-        else: raise ValueError(f"不支持的算法: {algorithm}")
-        
-        self.search_paths[algorithm] = path
-        
-        effective_path_length = len(path) - 1
-        
-        if effective_path_length > 0:
-            time_per_step = (max_time - setup_time) / effective_path_length
-        else:
-            time_per_step = max_time 
-            
+        # 1. 初始化 (递归贝叶斯框架)
+        # pso_guidance_map: 作为下一规划段的先验 (P_k|k-1)，初始为原始先验 (P_0)
+        pso_guidance_map = np.copy(self.probability_map) 
+        self.search_count_map = np.zeros_like(pso_guidance_map, dtype=int) 
         radius = max(1, int(self.coverage_width / 3 / (200/self.grid_width)))
-        
-        cumulative_prob = 0.0
-        probabilities = [0.0] * effective_path_length
-        cumulative_prob_weights = [0.0] * effective_path_length 
-        current_searched_prob_sum = 0.0
-        
-        searched_count_map = np.zeros_like(self.probability_map, dtype=int)
         k = self.k_efficiency 
+        
+        # 2. 路径函数映射
+        if algorithm == 'spiral': path_func = self.spiral_search_path
+        elif algorithm == 'grid': path_func = self.grid_search_path
+        elif algorithm == 'sector': path_func = self.sector_search_path
+        elif algorithm == 'pso': path_func = self.pso_search_path
+        else: raise ValueError(f"不支持的算法: {algorithm}")
+            
+        
+        # 路径分段：只有 PSO + 贝叶斯更新时进行分段重规划
+        num_segments = 1 if algorithm != 'pso' or not bayesian_update else 5
+        steps_per_segment = (max_time - setup_time) // num_segments
+        if steps_per_segment <= 0: steps_per_segment = max_time - setup_time
+        
+        full_path = [point_tuple] 
+        cumulative_prob_history = [0.0] 
+        total_time_history = [0.0]
+        prob_raw_history = [0.0]
+        weight_raw_history = [0.0]
+        current_cumulative_prob = 0.0
+        
+        # 3. 循环分段模拟
+        for segment in range(num_segments):
+            
+            # 3.1 路径规划 (预测步)
+            if algorithm == 'pso' and bayesian_update:
+                current_pos = full_path[-1]
+                # PSO 使用上一段的后验概率图 pso_guidance_map 作为指导
+                path_segment = self.pso_search_path(current_pos, steps_per_segment, pso_guidance_map=pso_guidance_map)
+            else:
+                # 非自适应算法只规划一次全路径
+                if segment == 0:
+                    path_segment = path_func(point_tuple, max_steps=(max_time-setup_time) + 1)
+                else:
+                    path_segment = [] 
+            
+            if len(path_segment) <= 1 and segment > 0: break
 
-        for step in range(effective_path_length):
-            x, y = path[step]
-            
-            new_searched_prob_weight = 0.0
-            new_found_prob_in_step = 0.0
-            
-            y_start = max(0, y - radius)
-            y_end = min(self.grid_height, y + radius + 1)
-            x_start = max(0, x - radius)
-            x_end = min(self.grid_width, x + radius + 1)
-            
-            for ny in range(y_start, y_end):
-                for nx in range(x_start, x_end):
-                    distance_sq = (nx - x)**2 + (ny - y)**2
-                    
-                    if distance_sq <= radius**2:
-                        P_Ci = self.probability_map[ny, nx]
+            if segment > 0 and path_segment: 
+                path_segment = path_segment[1:] # 移除起点（与上一段的终点重复）
+
+            # 3.2 模拟搜索 (更新步)
+            for step_point in path_segment:
+                if len(full_path) >= (max_time - setup_time) + 1: break 
+                
+                x, y = step_point
+                
+                new_found_prob_in_step = 0.0
+                new_searched_prob_weight = 0.0
+                
+                # 确定当前搜索范围
+                y_start = max(0, y - radius)
+                y_end = min(self.grid_height, y + radius + 1)
+                x_start = max(0, x - radius)
+                x_end = min(self.grid_width, x + radius + 1)
+                
+                # 3.2.1 更新 CPD 和搜索计数
+                for ny in range(y_start, y_end):
+                    for nx in range(x_start, x_end):
+                        distance_sq = (nx - x)**2 + (ny - y)**2
                         
-                        if searched_count_map[ny, nx] == 0:
-                            new_searched_prob_weight += P_Ci
-                        
-                        searched_count_map[ny, nx] += 1
-                        
-                        N = searched_count_map[ny, nx]
-                        P_Di = 1 - np.exp(-k * N)
-                        P_Di_old = 1 - np.exp(-k * (N - 1)) if N > 1 else 0
+                        if distance_sq <= radius**2:
                             
-                        P_increment = P_Ci * (P_Di - P_Di_old)
-                        new_found_prob_in_step += P_increment
-            
-            cumulative_prob += new_found_prob_in_step
-            current_searched_prob_sum += new_searched_prob_weight
-            
-            probabilities[step] = cumulative_prob
-            cumulative_prob_weights[step] = current_searched_prob_sum
-
-        time_points = [0.0] * len(path)
-        prob_points = [0.0] * len(path)
-        weight_points = [0.0] * len(path)
+                            # P_Ci: 当前位置 (ny, nx) 的最新信念概率 (上一阶段的后验)
+                            P_Ci = pso_guidance_map[ny, nx] 
+                            N_old = self.search_count_map[ny, nx]
+                            
+                            if N_old == 0:
+                                new_searched_prob_weight += self.probability_map[ny, nx] # 初始权重用原始先验
+                            
+                            self.search_count_map[ny, nx] += 1
+                            N_new = self.search_count_map[ny, nx]
+                            
+                            # P(D | C_i): 探测概率
+                            P_Di_new = 1 - np.exp(-k * N_new)
+                            P_Di_old = 1 - np.exp(-k * N_old) if N_old > 0 else 0
+                                
+                            # P_increment: 增量发现概率 = P(C_i) * [P(D_new | C_i) - P(D_old | C_i)]
+                            P_increment = P_Ci * (P_Di_new - P_Di_old)
+                            new_found_prob_in_step += P_increment
+                
+                current_cumulative_prob += new_found_prob_in_step
+                
+                full_path.append(step_point)
+                
+                # 3.2.2 贝叶斯更新 (仅在启用时)：计算新的后验概率图 (假设未找到)
+                if bayesian_update:
+                    # 贝叶斯公式 for 静态目标: P(C_i | NF) = P(NF | C_i) * P(C_i)_original / P(NF)_total
+                    
+                    # 1. 计算总的发现概率 P(D_total) 和总的未发现概率 P(NF)_total
+                    P_D_total = 0.0
+                    for row in range(self.grid_height):
+                        for col in range(self.grid_width):
+                            # P(C_i)_original: 原始先验概率
+                            P_Ci_prior_original = self.probability_map[row, col]
+                            N = self.search_count_map[row, col]
+                            P_Di = 1 - np.exp(-k * N) 
+                            P_D_total += P_Ci_prior_original * P_Di
+                            
+                    P_NF_total = 1.0 - P_D_total
+                    new_posterior_map = np.zeros_like(self.probability_map)
+                    
+                    if P_NF_total > 1e-9: 
+                        for row in range(self.grid_height):
+                            for col in range(self.grid_width):
+                                P_Ci_prior_original = self.probability_map[row, col]
+                                N = self.search_count_map[row, col]
+                                P_Di = 1 - np.exp(-k * N)
+                                
+                                P_NF_given_Ci = 1.0 - P_Di
+                                
+                                # 计算新的后验 P(C_i | NF)
+                                new_posterior_map[row, col] = (P_NF_given_Ci * P_Ci_prior_original) / P_NF_total
+                        
+                        # 更新指导图，用于下一次 PSO 规划 (递归)
+                        pso_guidance_map = new_posterior_map
+                    else:
+                        pass
+                
+                # 3.2.3 记录历史数据
+                time_per_step = (max_time - setup_time) / ((max_time - setup_time) if (max_time - setup_time) > 0 else 1)
+                total_time_history.append(total_time_history[-1] + time_per_step)
+                cumulative_prob_history.append(current_cumulative_prob)
+                prob_raw_history.append(current_cumulative_prob)
+                weight_raw_history.append(weight_raw_history[-1] + new_searched_prob_weight)
+                
+            if algorithm != 'pso' or not bayesian_update: break 
         
-        time_points[0] = 0
-        prob_points[0] = 0.0
-        weight_points[0] = 0.0 
+        # 4. 数据处理和返回
+        self.search_paths[algorithm] = full_path
         
-        for step in range(effective_path_length):
-            time_points[step + 1] = setup_time + (step + 1) * time_per_step
-            prob_points[step + 1] = probabilities[step]
-            weight_points[step + 1] = cumulative_prob_weights[step]
-            
+        time_points = total_time_history
+        prob_points = cumulative_prob_history
+        
         fixed_time_points = np.linspace(0, max_time, 50)
-        interpolated_prob_time = np.interp(fixed_time_points, time_points, prob_points)
+        interpolated_prob_time = np.interp(fixed_time_points, time_points, prob_points).tolist()
         
-        return fixed_time_points, interpolated_prob_time.tolist(), deployment_points, prob_points, weight_points, max_time
+        return fixed_time_points, interpolated_prob_time, deployment_points, prob_raw_history, weight_raw_history, max_time
 
     def _calculate_coverage_map(self, path, coverage_width):
         """计算给定路径的覆盖热力图 (用于可视化搜索效率)"""
@@ -436,7 +516,7 @@ class SingleUnitDroneSearch:
         return coverage_map
 
 
-# --- 运行函数：同时遍历组合和算法 ---
+# --- 运行函数：run_all_combinations_and_algorithms (修改为调用新的模拟函数) ---
 
 def run_all_combinations_and_algorithms(strategies_to_test, max_time=100):
     """运行所有策略、所有设备组合和所有算法并收集结果"""
@@ -474,7 +554,14 @@ def run_all_combinations_and_algorithms(strategies_to_test, max_time=100):
             
             for algo in algorithms:
                 try:
-                    time_points, probabilities_time, deployment_points, prob_points_raw, weight_points_raw, current_max_time = search_model.simulate_search(algo, max_time)
+                    # 关键修改：调用新的 simulate_search_bayesian 函数
+                    # 只有 PSO 算法启用 bayesian_update=True，实现动态路径规划
+                    is_pso_bayesian = (algo == 'pso')
+                    time_points, probabilities_time, deployment_points, prob_points_raw, weight_points_raw, current_max_time = search_model.simulate_search_bayesian(
+                        algo, 
+                        max_time, 
+                        bayesian_update=is_pso_bayesian
+                    )
                     path_data = search_model.search_paths.get(algo, [])
                     
                     all_results[strategy][combo_name][algo] = {
@@ -495,7 +582,7 @@ def run_all_combinations_and_algorithms(strategies_to_test, max_time=100):
     return base_models, all_results
 
 
-# --- 性能打印函数 (保持不变) ---
+# --- 性能打印函数 (更新 PSO 描述) ---
 
 def print_performance_metrics(all_results, strategy_key, combos_order, algorithms_order):
     """打印指定策略下，所有组合和算法的性能指标"""
@@ -515,7 +602,11 @@ def print_performance_metrics(all_results, strategy_key, combos_order, algorithm
             probabilities = res['prob_time'] 
             max_time = res['max_time']
                 
-            print(f"  > 搜索模式: {algo.upper()}")
+            algo_name = algo.upper()
+            if algo == 'pso':
+                 algo_name += ' (递归贝叶斯优化)'
+
+            print(f"  > 搜索模式: {algo_name}")
             
             target_probabilities = [0.5, 0.75, 0.9]
             
@@ -533,7 +624,7 @@ def print_performance_metrics(all_results, strategy_key, combos_order, algorithm
                 print(f"    最终累计探测概率 (CPD, T={search_time:.0f}): {final_prob*100:.1f}%")
 
 
-# --- 可视化函数 (修正图例位置) ---
+# --- 可视化函数 (更新 PSO 描述) ---
 
 def visualize_3x4_results(base_models, all_results, strategy_key, max_time=100):
     """
@@ -591,21 +682,21 @@ def visualize_3x4_results(base_models, all_results, strategy_key, max_time=100):
                 axes[row_idx, col_idx].set_title(title, fontsize=16)
 
         
-        # --- 列 0: 路径 (图例位置修正) ---
+        # --- 列 0: 路径 ---
         ax0 = axes[row_idx, 0]
         im0 = ax0.imshow(probability_map, cmap='hot_r', origin='lower', extent=[0, model.grid_width, 0, model.grid_height])
         ax0.plot(deployment_point[0], deployment_point[1], 'D', color='lime', markersize=12, markeredgecolor='black', markeredgewidth=1.5, label='部署点', zorder=5)
         
         for algo in algorithms_order:
             path = combo_results[algo]['path']
+            algo_label = f'{algo.capitalize()}'
+            if algo == 'pso': algo_label += ' (Bayes-Opt)'
+
             if len(path) > 0:
                 path_array = np.array(path)
-                ax0.plot(path_array[:, 0], path_array[:, 1], color=path_colors[algo], linestyle=path_linestyles[algo], linewidth=2.5, alpha=0.9, label=f'{algo.capitalize()}', zorder=4)
+                ax0.plot(path_array[:, 0], path_array[:, 1], color=path_colors[algo], linestyle=path_linestyles[algo], linewidth=2.5, alpha=0.9, label=algo_label, zorder=4)
         
-        # <<< --- 修正图例位置：从 'upper right' 改为 'upper left' --- >>>
         ax0.legend(loc='upper left', fontsize=8, frameon=True, fancybox=True, shadow=True)
-        # <<< -------------------------------------------------------- >>>
-        
         ax0.set_xlabel('X坐标 (网格单位)')
         ax0.set_ylabel('Y坐标 (网格单位)')
         if row_idx == 0:
@@ -617,7 +708,9 @@ def visualize_3x4_results(base_models, all_results, strategy_key, max_time=100):
         for algo in algorithms_order:
             time_points = combo_results[algo]['time']
             probabilities = combo_results[algo]['prob_time']
-            ax1.plot(time_points, probabilities, color=path_colors[algo], linestyle=path_linestyles[algo], linewidth=3.0, alpha=0.9, label=f'{algo.capitalize()}')
+            algo_label = f'{algo.capitalize()}'
+            if algo == 'pso': algo_label += ' (Bayes-Opt)'
+            ax1.plot(time_points, probabilities, color=path_colors[algo], linestyle=path_linestyles[algo], linewidth=3.0, alpha=0.9, label=algo_label)
         
         ax1.set_xlabel(f'搜索时间 (单位)')
         ax1.set_ylabel('累计探测概率 (CPD)')
@@ -632,7 +725,9 @@ def visualize_3x4_results(base_models, all_results, strategy_key, max_time=100):
         for algo in algorithms_order:
             prob_raw = combo_results[algo]['prob_raw']
             weight_raw = combo_results[algo]['weight_raw']
-            ax2.plot(weight_raw, prob_raw, color=path_colors[algo], linestyle=path_linestyles[algo], linewidth=3.0, alpha=0.9, label=f'{algo.capitalize()}')
+            algo_label = f'{algo.capitalize()}'
+            if algo == 'pso': algo_label += ' (Bayes-Opt)'
+            ax2.plot(weight_raw, prob_raw, color=path_colors[algo], linestyle=path_linestyles[algo], linewidth=3.0, alpha=0.9, label=algo_label)
 
         ax2.plot([0, 1], [0, 1], 'k--', alpha=0.3, label='理想效率')
         
@@ -669,7 +764,7 @@ def visualize_3x4_results(base_models, all_results, strategy_key, max_time=100):
 
     plt.tight_layout(rect=[0, 0, 1, 0.98]) 
     # 保存文件名包含策略名称
-    plt.savefig(f'search_3x4_analysis_corrected_{strategy_key}_performance.png', dpi=300, bbox_inches='tight')
+    plt.savefig(f'search_3x4_analysis_recursive_bayesian_pso_{strategy_key}_performance.png', dpi=300, bbox_inches='tight')
     plt.show()
 
 
